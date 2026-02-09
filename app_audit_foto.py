@@ -92,6 +92,29 @@ def db_insert(conn, row: dict):
     ))
 
 # =========================
+# RESET / HAPUS HISTORY AUDIT (LEBIH AMAN)
+# =========================
+st.sidebar.divider()
+st.sidebar.subheader("🧹 Reset History Audit")
+
+confirm_reset = st.sidebar.checkbox("Saya yakin mau hapus total history", value=False)
+
+if st.sidebar.button("🗑️ HAPUS TOTAL HISTORY (RESET)"):
+    if not confirm_reset:
+        st.sidebar.warning("Centang dulu konfirmasi biar tidak kepencet salah.")
+    else:
+        try:
+            if os.path.exists(DB_PATH):
+                os.remove(DB_PATH)
+                st.sidebar.success("✅ History audit berhasil dihapus. Aplikasi akan refresh.")
+                st.rerun()
+            else:
+                st.sidebar.info("ℹ️ File history tidak ditemukan (history sudah kosong).")
+        except PermissionError:
+            st.sidebar.error("❌ Gagal hapus DB. Tutup aplikasi lain yang mungkin sedang membuka file DB.")
+        except Exception as e:
+            st.sidebar.error(f"❌ Gagal hapus DB: {e}")
+# =========================
 # IMAGE QUALITY / CLASSIFIER (SKIP LOGO / TEMPLATE)
 # =========================
 def image_entropy(img: Image.Image) -> float:

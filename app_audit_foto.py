@@ -19,7 +19,7 @@ import math
 # =========================
 st.set_page_config(page_title="Audit Foto Patroli", layout="wide")
 st.title("🕵️ AUDIT FOTO PATROLI (Anti Duplikat + Anti Rename)")
-st.caption("Audit foto patroli saja (lapangan + geo). Logo/header/template akan di-SKIP otomatis.")
+st.caption("Audit foto patroli yang terduplicate. Logo/header/template akan tidak akan ter-audit.")
 
 # =========================
 # SIDEBAR FILTER (ANTI LOGO / ANOMALI)

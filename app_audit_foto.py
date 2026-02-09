@@ -18,7 +18,7 @@ import math
 # CONFIG UI
 # =========================
 st.set_page_config(page_title="Audit Foto Patroli", layout="wide")
-st.title("🕵️ AUDIT FOTO PATROLI (Anti Duplikat + Anti Rename)")
+st.title("🕵️ AUDIT FOTO PATROLI")
 st.caption("Audit foto patroli yang terduplicate. Logo/header/template akan tidak akan ter-audit.")
 
 # =========================

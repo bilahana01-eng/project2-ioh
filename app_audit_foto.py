@@ -17,7 +17,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 # CONFIG UI
 # =========================
 st.set_page_config(page_title="Audit Foto Patroli", layout="wide")
-st.title("🕵️ AUDIT FOTO PATROLI (Anti Duplikat + Anti Rename)")
+st.title("🕵️ AUDIT FOTO PATROLI")
 st.caption("Mendeteksi foto yang sama walau rename / repost lintas bulan. Support foto embedded Excel + Google Docs/Drive link.")
 
 # =========================

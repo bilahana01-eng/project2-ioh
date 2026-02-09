@@ -18,7 +18,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 # =========================
 st.set_page_config(page_title="Audit Foto Patroli", layout="wide")
 st.title("🕵️ AUDIT FOTO PATROLI")
-st.caption("Audit foto patroli yang terduplicate (Embedded Excel + Google Docs/Drive). Tidak pakai slider filter. Skip hanya berdasarkan keyword.")
+st.caption("Audit foto patroli yang ter-duplicate (Embedded Excel + Google Docs/Drive). Maks preview gambar 500 (langsung set 500 saja). Menyetorkan file excel ke sini.")
 
 # =========================
 # SKIP RULE (TANPA SLIDER)

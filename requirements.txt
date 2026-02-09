@@ -1,1 +1,6 @@
 streamlit
+pandas
+openpyxl
+Pillow
+ImageHash
+requests

@@ -21,23 +21,25 @@ st.set_page_config(page_title="Audit Foto Patroli", layout="wide")
 st.title("🕵️ AUDIT FOTO PATROLI")
 st.caption(
     "Audit foto patroli yang ter-duplicate (Embedded Excel + Google Docs/Drive). "
-    "Set maks. preview gambar 500."
+    "Hanya foto patroli yang memiliki overlay GEO/GMAPS yang diaudit (VALID/GUGUR/CEK MANUAL). "
+    "Gambar logo-only / banner-only tidak ikut audit."
 )
 
 # =========================
-# RULES
+# SKIP RULE (tanpa slider)
 # =========================
-# Skip jika segment mengandung keyword ini (kalau segment ada)
+# Keyword ini hanya dipakai untuk membantu mendeteksi "logo-only/template-only"
+# TAPI jika foto terdeteksi GEO/GMAPS, maka keyword ini TIDAK akan membuat skip.
 SKIP_SEGMENT_KEYWORDS = ["logo", "cover", "header", "template"]
 
-def should_skip_by_segment(segment_text: str) -> tuple[bool, str]:
+def segment_has_skip_keyword(segment_text: str) -> bool:
     seg = (segment_text or "").strip().lower()
-    if any(k in seg for k in SKIP_SEGMENT_KEYWORDS):
-        return True, "SKIP: segment keyword"
-    return False, ""
+    if not seg:
+        return False
+    return any(k in seg for k in SKIP_SEGMENT_KEYWORDS)
 
 # =========================
-# IMAGE HEURISTIC: DETEKSI GMAPS/OVERLAY MAP (TANPA SLIDER)
+# IMAGE HEURISTIC: DETEKSI GEO/GMAPS OVERLAY
 # =========================
 def entropy_gray(img: Image.Image) -> float:
     g = img.convert("L")
@@ -53,11 +55,9 @@ def entropy_gray(img: Image.Image) -> float:
     return ent
 
 def edge_density_simple(img: Image.Image) -> float:
-    # pakai perbedaan piksel sederhana agar ringan (tanpa ImageFilter)
     g = img.convert("L").resize((160, 160))
     px = list(g.getdata())
     w, h = g.size
-    # hitung "edge" sebagai selisih absolut horizontal + vertikal (rata-rata)
     s = 0
     cnt = 0
     for y in range(h - 1):
@@ -65,57 +65,82 @@ def edge_density_simple(img: Image.Image) -> float:
             i = y * w + x
             s += abs(px[i] - px[i + 1]) + abs(px[i] - px[i + w])
             cnt += 2
-    # normalisasi kasar
     return (s / max(cnt, 1)) / 255.0
 
-def is_likely_gmaps_overlay(img: Image.Image) -> tuple[bool, str]:
+def bright_text_score(img: Image.Image) -> float:
     """
-    Heuristik sederhana:
-    - Banyak foto patroli + geo punya inset peta di kiri bawah (warna ramai)
-    - Logo/header cenderung flat & tidak punya patch peta yang "ramai"
-    Kita cek patch kiri-bawah:
-      - entropy cukup tinggi
-      - edge density cukup tinggi
+    Skor kasar untuk 'overlay teks putih' (koordinat/timestamp) di bawah/kanan:
+    - crop area bawah-kanan
+    - hitung proporsi piksel terang
     """
     w, h = img.size
-    if w < 220 or h < 220:
-        return False, "Non-GMaps: ukuran terlalu kecil"
+    # area bawah-kanan (umumnya teks koordinat ada di situ)
+    x1 = int(w * 0.52)
+    y1 = int(h * 0.62)
+    patch = img.crop((x1, y1, w, h)).convert("L").resize((200, 200))
 
-    # ambil patch kiri-bawah (umumnya map inset)
+    px = list(patch.getdata())
+    # piksel "terang" (teks putih biasanya > 210)
+    bright = sum(1 for p in px if p > 210)
+    return bright / max(len(px), 1)
+
+def map_inset_score(img: Image.Image) -> tuple[float, float]:
+    """
+    Nilai patch kiri-bawah (umumnya map inset):
+    return (entropy, edge_density)
+    """
+    w, h = img.size
     x1 = 0
     y1 = int(h * 0.68)
-    x2 = int(w * 0.38)
+    x2 = int(w * 0.40)
     y2 = h
     patch = img.crop((x1, y1, x2, y2)).convert("RGB")
 
     ent = entropy_gray(patch)
     ed = edge_density_simple(patch)
+    return ent, ed
 
-    # threshold fix (tanpa slider)
-    # map inset biasanya entropy & edge lebih tinggi daripada logo/flat
-    if ent >= 4.2 and ed >= 0.06:
-        return True, f"GMaps-like (patch ent={ent:.2f}, edge={ed:.2f})"
+def is_geo_gmaps(img: Image.Image) -> tuple[bool, str]:
+    """
+    GEO/GMAPS dianggap ada jika minimal salah satu terpenuhi:
+    A) Map inset kiri-bawah terlihat "ramai"
+    B) Ada overlay teks putih koordinat/timestamp cukup banyak di bawah-kanan
+    """
+    w, h = img.size
+    if w < 240 or h < 240:
+        return False, "Non-GEO: ukuran terlalu kecil"
 
-    return False, f"Non-GMaps (patch ent={ent:.2f}, edge={ed:.2f})"
+    ent, ed = map_inset_score(img)
+    bt = bright_text_score(img)
+
+    # Threshold dibuat lebih "longgar" supaya foto patroli yang valid tidak ke-skip.
+    has_map_inset = (ent >= 3.8 and ed >= 0.045)   # longgar dari sebelumnya
+    has_geo_text  = (bt >= 0.020)                  # 2% piksel terang -> biasanya ada overlay teks
+
+    if has_map_inset and has_geo_text:
+        return True, f"GEO ok (map ent={ent:.2f}, edge={ed:.2f}, text={bt:.3f})"
+    if has_map_inset:
+        return True, f"GEO ok (map ent={ent:.2f}, edge={ed:.2f})"
+    if has_geo_text:
+        return True, f"GEO ok (text={bt:.3f})"
+
+    return False, f"Non-GEO (map ent={ent:.2f}, edge={ed:.2f}, text={bt:.3f})"
 
 def classify_for_audit(img: Image.Image, segment_text: str) -> tuple[bool, str, str]:
     """
-    Return:
-      audit_ok (bool): True jika foto boleh masuk proses audit duplikat
-      status_if_skip: status kalau tidak diaudit
-      reason: alasan
+    RULE FINAL:
+    - Jika GEO/GMAPS terdeteksi -> MASUK AUDIT (logo perusahaan boleh ada).
+    - Jika tidak GEO -> SKIP (Non-Patroli) (termasuk logo-only/template-only).
+    - Keyword segment hanya membantu menjelaskan skip_reason, bukan penentu jika GEO ada.
     """
-    # 1) skip dari segment (kalau ada keyword)
-    sskip, sreason = should_skip_by_segment(segment_text)
-    if sskip:
-        return False, "⏭️ SKIP (Non-Patroli)", sreason
+    ok, why = is_geo_gmaps(img)
+    if ok:
+        return True, "", ""
 
-    # 2) hanya audit yang ada gmaps/geo overlay
-    ok, why = is_likely_gmaps_overlay(img)
-    if not ok:
-        return False, "⏭️ SKIP (Non-Patroli)", why
-
-    return True, "", ""
+    # Non-GEO -> skip
+    if segment_has_skip_keyword(segment_text):
+        return False, "⏭️ SKIP (Logo/Template)", "SKIP: segment keyword + tidak ada GEO overlay"
+    return False, "⏭️ SKIP (Non-Patroli)", why
 
 
 # =========================
@@ -196,7 +221,6 @@ def compute_hashes_from_bytes(img_bytes: bytes):
         img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
     except UnidentifiedImageError:
         return None, None, None, None
-
     thumb = img.copy()
     thumb.thumbnail((220, 220))
     ph = str(imagehash.phash(thumb))
@@ -364,7 +388,6 @@ def extract_link_images(wb, source_file_name: str, max_workers=12):
     def worker(job):
         sheet, r, col_link, cluster, segment, url = job
         img_bytes_list = download_images_from_url(url)
-
         out = []
         for idx, b in enumerate(img_bytes_list, start=1):
             if not b:
@@ -429,23 +452,16 @@ def audit_workbook(xlsx_path: str):
     if df.empty:
         return df
 
-    # yang benar-benar diaudit = status_akhir kosong & sha256 terisi
     audited_mask = (df["status_akhir"].astype(str).str.strip() == "") & (df["sha256"].astype(str).str.strip() != "")
     df_audit = df[audited_mask].copy()
     df_skip = df[~audited_mask].copy()
 
     if df_audit.empty:
-        # tidak ada gmaps yang lolos klasifikasi
-        # tetap kembalikan df (isi SKIP semua)
-        if "dup_internal_exact" not in df.columns:
-            df["dup_internal_exact"] = ""
-            df["dup_internal_phash"] = ""
-            df["history_status"] = ""
-            df["history_detail"] = ""
-            df["first_seen"] = ""
+        for col in ["dup_internal_exact","dup_internal_phash","history_status","history_detail","first_seen"]:
+            if col not in df.columns:
+                df[col] = ""
         return df
 
-    # internal dup exact/phash hanya untuk audited
     df_audit["dup_internal_exact"] = df_audit.duplicated("sha256", keep="first")
     df_audit["dup_internal_phash"] = df_audit.duplicated("phash", keep="first")
 
@@ -481,7 +497,6 @@ def audit_workbook(xlsx_path: str):
 
     df_audit["status_akhir"] = df_audit.apply(decide, axis=1)
 
-    # Simpan hanya VALID ke DB (hanya audited gmaps)
     for _, r in df_audit[df_audit["status_akhir"] == "✅ VALID"].iterrows():
         db_insert(conn, {
             "sha256": r["sha256"],
@@ -498,13 +513,11 @@ def audit_workbook(xlsx_path: str):
     conn.commit()
     conn.close()
 
-    # Pastikan kolom audit ada pada df_skip biar tabel rapi
     for col in ["dup_internal_exact","dup_internal_phash","history_status","history_detail","first_seen"]:
         if col not in df_skip.columns:
             df_skip[col] = ""
 
-    out = pd.concat([df_audit, df_skip], ignore_index=True)
-    return out
+    return pd.concat([df_audit, df_skip], ignore_index=True)
 
 # =========================
 # STREAMLIT UI
@@ -530,8 +543,7 @@ if uploaded:
             else:
                 status.update(label="Audit selesai.", state="complete")
 
-                # Ringkasan: hitung hanya yang diaudit (bukan SKIP)
-                audited_only = df[(df["status_akhir"].astype(str).str.startswith("⏭️ SKIP") == False)]
+                audited_only = df[~df["status_akhir"].astype(str).str.startswith("⏭️ SKIP")]
 
                 st.subheader("Ringkasan")
                 c1, c2, c3, c4 = st.columns(4)
@@ -558,7 +570,6 @@ if uploaded:
                 shown = 0
                 cols = st.columns(4)
 
-                # prioritas: yang bermasalah dulu, lalu SKIP, terakhir VALID
                 def prio(s):
                     s = str(s)
                     if "GUGUR" in s or "CEK MANUAL" in s:

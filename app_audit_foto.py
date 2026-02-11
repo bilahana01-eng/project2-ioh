@@ -12,25 +12,112 @@ import hashlib
 import requests
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import math
 
 # =========================
 # CONFIG UI
 # =========================
 st.set_page_config(page_title="Audit Foto Patroli", layout="wide")
 st.title("🕵️ AUDIT FOTO PATROLI")
-st.caption("Audit foto patroli yang ter-duplicate (Embedded Excel + Google Docs/Drive). Maks preview gambar 500 (langsung set 500 saja). Menyetorkan file excel ke sini.")
+st.caption(
+    "Audit foto patroli yang ter-duplicate (Embedded Excel + Google Docs/Drive). "
+    "Hanya foto yang ber-overlay peta/geo (GMaps/Map inset) yang diaudit. "
+    "Logo/header/template tidak ikut audit."
+)
 
 # =========================
-# SKIP RULE (TANPA SLIDER)
+# RULES
 # =========================
-# Hanya skip jika segment mengandung keyword ini:
+# Skip jika segment mengandung keyword ini (kalau segment ada)
 SKIP_SEGMENT_KEYWORDS = ["logo", "cover", "header", "template"]
 
-def should_skip(segment_text: str) -> tuple[bool, str]:
+def should_skip_by_segment(segment_text: str) -> tuple[bool, str]:
     seg = (segment_text or "").strip().lower()
     if any(k in seg for k in SKIP_SEGMENT_KEYWORDS):
         return True, "SKIP: segment keyword"
     return False, ""
+
+# =========================
+# IMAGE HEURISTIC: DETEKSI GMAPS/OVERLAY MAP (TANPA SLIDER)
+# =========================
+def entropy_gray(img: Image.Image) -> float:
+    g = img.convert("L")
+    hist = g.histogram()
+    total = sum(hist)
+    if total == 0:
+        return 0.0
+    ent = 0.0
+    for h in hist:
+        if h:
+            p = h / total
+            ent -= p * math.log2(p)
+    return ent
+
+def edge_density_simple(img: Image.Image) -> float:
+    # pakai perbedaan piksel sederhana agar ringan (tanpa ImageFilter)
+    g = img.convert("L").resize((160, 160))
+    px = list(g.getdata())
+    w, h = g.size
+    # hitung "edge" sebagai selisih absolut horizontal + vertikal (rata-rata)
+    s = 0
+    cnt = 0
+    for y in range(h - 1):
+        for x in range(w - 1):
+            i = y * w + x
+            s += abs(px[i] - px[i + 1]) + abs(px[i] - px[i + w])
+            cnt += 2
+    # normalisasi kasar
+    return (s / max(cnt, 1)) / 255.0
+
+def is_likely_gmaps_overlay(img: Image.Image) -> tuple[bool, str]:
+    """
+    Heuristik sederhana:
+    - Banyak foto patroli + geo punya inset peta di kiri bawah (warna ramai)
+    - Logo/header cenderung flat & tidak punya patch peta yang "ramai"
+    Kita cek patch kiri-bawah:
+      - entropy cukup tinggi
+      - edge density cukup tinggi
+    """
+    w, h = img.size
+    if w < 220 or h < 220:
+        return False, "Non-GMaps: ukuran terlalu kecil"
+
+    # ambil patch kiri-bawah (umumnya map inset)
+    x1 = 0
+    y1 = int(h * 0.68)
+    x2 = int(w * 0.38)
+    y2 = h
+    patch = img.crop((x1, y1, x2, y2)).convert("RGB")
+
+    ent = entropy_gray(patch)
+    ed = edge_density_simple(patch)
+
+    # threshold fix (tanpa slider)
+    # map inset biasanya entropy & edge lebih tinggi daripada logo/flat
+    if ent >= 4.2 and ed >= 0.06:
+        return True, f"GMaps-like (patch ent={ent:.2f}, edge={ed:.2f})"
+
+    return False, f"Non-GMaps (patch ent={ent:.2f}, edge={ed:.2f})"
+
+def classify_for_audit(img: Image.Image, segment_text: str) -> tuple[bool, str, str]:
+    """
+    Return:
+      audit_ok (bool): True jika foto boleh masuk proses audit duplikat
+      status_if_skip: status kalau tidak diaudit
+      reason: alasan
+    """
+    # 1) skip dari segment (kalau ada keyword)
+    sskip, sreason = should_skip_by_segment(segment_text)
+    if sskip:
+        return False, "⏭️ SKIP (Non-Patroli)", sreason
+
+    # 2) hanya audit yang ada gmaps/geo overlay
+    ok, why = is_likely_gmaps_overlay(img)
+    if not ok:
+        return False, "⏭️ SKIP (Non-Patroli)", why
+
+    return True, "", ""
+
 
 # =========================
 # DATABASE
@@ -109,12 +196,13 @@ def compute_hashes_from_bytes(img_bytes: bytes):
     try:
         img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
     except UnidentifiedImageError:
-        return None, None, None
+        return None, None, None, None
+
     thumb = img.copy()
     thumb.thumbnail((220, 220))
     ph = str(imagehash.phash(thumb))
     sh = sha256_bytes(img_bytes)
-    return sh, ph, thumb
+    return sh, ph, thumb, img
 
 # =========================
 # GOOGLE LINK HANDLING
@@ -129,9 +217,9 @@ def build_gdocs_export_docx_url(doc_id: str) -> str:
 def build_drive_download_url(file_id: str) -> str:
     return f"https://drive.google.com/uc?export=download&id={file_id}"
 
-def http_get_bytes(session: requests.Session, url: str, timeout=25):
+def http_get_bytes(url: str, timeout=25):
     try:
-        r = session.get(url, timeout=timeout, stream=True, allow_redirects=True)
+        r = requests.get(url, timeout=timeout, stream=True, allow_redirects=True)
         if r.status_code != 200:
             return None
         return r.content
@@ -149,26 +237,26 @@ def extract_images_from_docx_bytes(docx_bytes: bytes) -> list[bytes]:
                     pass
     return out
 
-def download_images_from_url(session: requests.Session, url: str) -> list[bytes]:
+def download_images_from_url(url: str) -> list[bytes]:
     if not url or not isinstance(url, str):
         return []
 
     m = DOC_ID_RE.search(url)
     if m:
         doc_id = m.group(1)
-        docx_bytes = http_get_bytes(session, build_gdocs_export_docx_url(doc_id))
+        docx_bytes = http_get_bytes(build_gdocs_export_docx_url(doc_id))
         if not docx_bytes:
             return []
         return extract_images_from_docx_bytes(docx_bytes)
 
     m = DRIVE_FILE_ID_RE.search(url)
     if m:
-        b = http_get_bytes(session, build_drive_download_url(m.group(1)))
+        b = http_get_bytes(build_drive_download_url(m.group(1)))
         return [b] if b else []
 
     m = GENERIC_ID_RE.search(url)
     if m and "google" in url:
-        b = http_get_bytes(session, build_drive_download_url(m.group(1)))
+        b = http_get_bytes(build_drive_download_url(m.group(1)))
         return [b] if b else []
 
     return []
@@ -212,13 +300,27 @@ def extract_embedded_images(wb, source_file_name: str):
                 cluster = ws.cell(row=row, column=col_cluster).value or "N/A"
                 segment = ws.cell(row=row, column=col_segment).value or "N/A"
 
-                skip, reason = should_skip(str(segment))
-                if skip:
+                raw = img_obj._data()
+                sh, ph, thumb, full_img = compute_hashes_from_bytes(raw)
+                if full_img is None:
                     continue
 
-                img_bytes = img_obj._data()
-                sh, ph, thumb = compute_hashes_from_bytes(img_bytes)
-                if not sh:
+                audit_ok, skip_status, skip_reason = classify_for_audit(full_img, str(segment))
+                if not audit_ok:
+                    items.append({
+                        "source_type": "EmbeddedExcel",
+                        "source_file": source_file_name,
+                        "sheet": ws.title,
+                        "location": f"R{row}C{col}",
+                        "cluster": str(cluster),
+                        "segment": str(segment),
+                        "url": "",
+                        "sha256": "",
+                        "phash": "",
+                        "status_akhir": skip_status,
+                        "skip_reason": skip_reason,
+                        "thumb": thumb
+                    })
                     continue
 
                 items.append({
@@ -231,6 +333,8 @@ def extract_embedded_images(wb, source_file_name: str):
                     "url": "",
                     "sha256": sh,
                     "phash": ph,
+                    "status_akhir": "",
+                    "skip_reason": "",
                     "thumb": thumb
                 })
             except:
@@ -253,29 +357,41 @@ def extract_link_images(wb, source_file_name: str, max_workers=12):
 
             cluster = ws.cell(r, col_cluster).value or "N/A"
             segment = ws.cell(r, col_segment).value or "N/A"
-
-            skip, reason = should_skip(str(segment))
-            if skip:
-                continue
-
             jobs.append((ws.title, r, col_link, str(cluster), str(segment), url))
 
     if not jobs:
         return items
 
-    session = requests.Session()
-    session.headers.update({"User-Agent": "PatrolPhotoAudit/1.0"})
-
     def worker(job):
         sheet, r, col_link, cluster, segment, url = job
-        img_bytes_list = download_images_from_url(session, url)
+        img_bytes_list = download_images_from_url(url)
+
         out = []
         for idx, b in enumerate(img_bytes_list, start=1):
             if not b:
                 continue
-            sh, ph, thumb = compute_hashes_from_bytes(b)
-            if not sh:
+            sh, ph, thumb, full_img = compute_hashes_from_bytes(b)
+            if full_img is None:
                 continue
+
+            audit_ok, skip_status, skip_reason = classify_for_audit(full_img, str(segment))
+            if not audit_ok:
+                out.append({
+                    "source_type": "CloudLink",
+                    "source_file": source_file_name,
+                    "sheet": sheet,
+                    "location": f"R{r}C{col_link}#IMG{idx}",
+                    "cluster": cluster,
+                    "segment": segment,
+                    "url": url,
+                    "sha256": "",
+                    "phash": "",
+                    "status_akhir": skip_status,
+                    "skip_reason": skip_reason,
+                    "thumb": thumb
+                })
+                continue
+
             out.append({
                 "source_type": "CloudLink",
                 "source_file": source_file_name,
@@ -286,6 +402,8 @@ def extract_link_images(wb, source_file_name: str, max_workers=12):
                 "url": url,
                 "sha256": sh,
                 "phash": ph,
+                "status_akhir": "",
+                "skip_reason": "",
                 "thumb": thumb
             })
         return out
@@ -312,15 +430,32 @@ def audit_workbook(xlsx_path: str):
     if df.empty:
         return df
 
-    df["dup_internal_exact"] = df.duplicated("sha256", keep="first")
-    df["dup_internal_phash"] = df.duplicated("phash", keep="first")
+    # yang benar-benar diaudit = status_akhir kosong & sha256 terisi
+    audited_mask = (df["status_akhir"].astype(str).str.strip() == "") & (df["sha256"].astype(str).str.strip() != "")
+    df_audit = df[audited_mask].copy()
+    df_skip = df[~audited_mask].copy()
+
+    if df_audit.empty:
+        # tidak ada gmaps yang lolos klasifikasi
+        # tetap kembalikan df (isi SKIP semua)
+        if "dup_internal_exact" not in df.columns:
+            df["dup_internal_exact"] = ""
+            df["dup_internal_phash"] = ""
+            df["history_status"] = ""
+            df["history_detail"] = ""
+            df["first_seen"] = ""
+        return df
+
+    # internal dup exact/phash hanya untuk audited
+    df_audit["dup_internal_exact"] = df_audit.duplicated("sha256", keep="first")
+    df_audit["dup_internal_phash"] = df_audit.duplicated("phash", keep="first")
 
     conn = get_db()
     today = datetime.now().strftime("%Y-%m-%d")
-    df["first_seen"] = today
+    df_audit["first_seen"] = today
 
     hist_status, hist_detail = [], []
-    for _, row in df.iterrows():
+    for _, row in df_audit.iterrows():
         exact, ph = db_lookup(conn, row["sha256"], row["phash"])
         if exact:
             hist_status.append("REUPLOAD_EXACT")
@@ -331,8 +466,8 @@ def audit_workbook(xlsx_path: str):
         else:
             hist_status.append("NEW")
             hist_detail.append("")
-    df["history_status"] = hist_status
-    df["history_detail"] = hist_detail
+    df_audit["history_status"] = hist_status
+    df_audit["history_detail"] = hist_detail
 
     def decide(r):
         if r["history_status"] == "REUPLOAD_EXACT":
@@ -345,9 +480,10 @@ def audit_workbook(xlsx_path: str):
             return "⚠️ CEK MANUAL (Duplikat Mirip di File Ini)"
         return "✅ VALID"
 
-    df["status_akhir"] = df.apply(decide, axis=1)
+    df_audit["status_akhir"] = df_audit.apply(decide, axis=1)
 
-    for _, r in df[df["status_akhir"] == "✅ VALID"].iterrows():
+    # Simpan hanya VALID ke DB (hanya audited gmaps)
+    for _, r in df_audit[df_audit["status_akhir"] == "✅ VALID"].iterrows():
         db_insert(conn, {
             "sha256": r["sha256"],
             "phash": r["phash"],
@@ -363,7 +499,13 @@ def audit_workbook(xlsx_path: str):
     conn.commit()
     conn.close()
 
-    return df
+    # Pastikan kolom audit ada pada df_skip biar tabel rapi
+    for col in ["dup_internal_exact","dup_internal_phash","history_status","history_detail","first_seen"]:
+        if col not in df_skip.columns:
+            df_skip[col] = ""
+
+    out = pd.concat([df_audit, df_skip], ignore_index=True)
+    return out
 
 # =========================
 # STREAMLIT UI
@@ -389,12 +531,15 @@ if uploaded:
             else:
                 status.update(label="Audit selesai.", state="complete")
 
+                # Ringkasan: hitung hanya yang diaudit (bukan SKIP)
+                audited_only = df[(df["status_akhir"].astype(str).str.startswith("⏭️ SKIP") == False)]
+
                 st.subheader("Ringkasan")
                 c1, c2, c3, c4 = st.columns(4)
-                c1.metric("Total Foto", len(df))
-                c2.metric("VALID", int((df["status_akhir"] == "✅ VALID").sum()))
-                c3.metric("GUGUR", int(df["status_akhir"].astype(str).str.contains("GUGUR").sum()))
-                c4.metric("CEK MANUAL", int(df["status_akhir"].astype(str).str.contains("CEK MANUAL").sum()))
+                c1.metric("Total Foto (Diaudit)", len(audited_only))
+                c2.metric("VALID", int((audited_only["status_akhir"] == "✅ VALID").sum()))
+                c3.metric("GUGUR", int(audited_only["status_akhir"].astype(str).str.contains("GUGUR").sum()))
+                c4.metric("CEK MANUAL", int(audited_only["status_akhir"].astype(str).str.contains("CEK MANUAL").sum()))
 
                 st.subheader("Laporan")
                 report = df.drop(columns=["thumb"], errors="ignore")
@@ -413,18 +558,29 @@ if uploaded:
                 st.subheader("Preview (dibatasi)")
                 shown = 0
                 cols = st.columns(4)
-                # prioritas: bermasalah dulu
-                dfv = df.copy()
-                pr = dfv["status_akhir"].map(lambda s: 0 if "GUGUR" in str(s) or "CEK MANUAL" in str(s) else 1)
-                dfv = dfv.assign(_p=pr).sort_values("_p").drop(columns=["_p"])
 
-                for _, r in dfv.iterrows():
+                # prioritas: yang bermasalah dulu, lalu SKIP, terakhir VALID
+                def prio(s):
+                    s = str(s)
+                    if "GUGUR" in s or "CEK MANUAL" in s:
+                        return 0
+                    if s.startswith("⏭️ SKIP"):
+                        return 1
+                    return 2
+
+                df_view = df.copy()
+                df_view["_p"] = df_view["status_akhir"].map(prio)
+                df_view = df_view.sort_values("_p").drop(columns=["_p"])
+
+                for _, r in df_view.iterrows():
                     if preview_limit == 0 or shown >= preview_limit:
                         break
                     if r.get("thumb") is None:
                         continue
                     with cols[shown % 4]:
                         st.image(r["thumb"], caption=f'{r["sheet"]} | {r["location"]}\n{r["status_akhir"]}')
+                        if r.get("skip_reason"):
+                            st.caption(r["skip_reason"])
                         if r.get("history_detail"):
                             st.caption(r["history_detail"])
                     shown += 1

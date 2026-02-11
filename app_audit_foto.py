@@ -33,8 +33,6 @@ uploaded = st.file_uploader("Upload Excel Patroli (.xlsx)", type=["xlsx"])
 colA, colB = st.columns([1, 2])
 with colA:
     preview_limit = st.number_input("Maks preview gambar", min_value=0, max_value=500, value=120, step=10)
-with colB:
-    st.info("Tip: Kalau uploader tidak kelihatan, biasanya karena zoom/scroll. Sekarang uploader sudah dipasang di atas.")
 
 # =========================
 # DATABASE

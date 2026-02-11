@@ -21,8 +21,7 @@ st.set_page_config(page_title="Audit Foto Patroli", layout="wide")
 st.title("🕵️ AUDIT FOTO PATROLI")
 st.caption(
     "Audit foto patroli yang ter-duplicate (Embedded Excel + Google Docs/Drive). "
-    "Hanya foto yang ber-overlay peta/geo (GMaps/Map inset) yang diaudit. "
-    "Logo/header/template tidak ikut audit."
+    "Set maks. preview gambar 500."
 )
 
 # =========================

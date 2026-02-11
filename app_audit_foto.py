@@ -20,126 +20,10 @@ import math
 st.set_page_config(page_title="Audit Foto Patroli", layout="wide")
 st.title("🕵️ AUDIT FOTO PATROLI")
 st.caption(
-    "Audit foto patroli yang ter-duplicate (Embedded Excel + Google Docs/Drive). Set maks. preview gambar 500."
+    "Audit foto patroli yang ter-duplicate (Embedded Excel + Google Docs/Drive). "
+    "Hanya foto yang punya overlay koordinat/timestamp GEO (kotak gelap + teks putih) yang diaudit. "
+    "Logo-only / banner-only tidak ikut audit."
 )
-
-# =========================
-# SKIP RULE (tanpa slider)
-# =========================
-# Keyword ini hanya dipakai untuk membantu mendeteksi "logo-only/template-only"
-# TAPI jika foto terdeteksi GEO/GMAPS, maka keyword ini TIDAK akan membuat skip.
-SKIP_SEGMENT_KEYWORDS = ["logo", "cover", "header", "template"]
-
-def segment_has_skip_keyword(segment_text: str) -> bool:
-    seg = (segment_text or "").strip().lower()
-    if not seg:
-        return False
-    return any(k in seg for k in SKIP_SEGMENT_KEYWORDS)
-
-# =========================
-# IMAGE HEURISTIC: DETEKSI GEO/GMAPS OVERLAY
-# =========================
-def entropy_gray(img: Image.Image) -> float:
-    g = img.convert("L")
-    hist = g.histogram()
-    total = sum(hist)
-    if total == 0:
-        return 0.0
-    ent = 0.0
-    for h in hist:
-        if h:
-            p = h / total
-            ent -= p * math.log2(p)
-    return ent
-
-def edge_density_simple(img: Image.Image) -> float:
-    g = img.convert("L").resize((160, 160))
-    px = list(g.getdata())
-    w, h = g.size
-    s = 0
-    cnt = 0
-    for y in range(h - 1):
-        for x in range(w - 1):
-            i = y * w + x
-            s += abs(px[i] - px[i + 1]) + abs(px[i] - px[i + w])
-            cnt += 2
-    return (s / max(cnt, 1)) / 255.0
-
-def bright_text_score(img: Image.Image) -> float:
-    """
-    Skor kasar untuk 'overlay teks putih' (koordinat/timestamp) di bawah/kanan:
-    - crop area bawah-kanan
-    - hitung proporsi piksel terang
-    """
-    w, h = img.size
-    # area bawah-kanan (umumnya teks koordinat ada di situ)
-    x1 = int(w * 0.52)
-    y1 = int(h * 0.62)
-    patch = img.crop((x1, y1, w, h)).convert("L").resize((200, 200))
-
-    px = list(patch.getdata())
-    # piksel "terang" (teks putih biasanya > 210)
-    bright = sum(1 for p in px if p > 210)
-    return bright / max(len(px), 1)
-
-def map_inset_score(img: Image.Image) -> tuple[float, float]:
-    """
-    Nilai patch kiri-bawah (umumnya map inset):
-    return (entropy, edge_density)
-    """
-    w, h = img.size
-    x1 = 0
-    y1 = int(h * 0.68)
-    x2 = int(w * 0.40)
-    y2 = h
-    patch = img.crop((x1, y1, x2, y2)).convert("RGB")
-
-    ent = entropy_gray(patch)
-    ed = edge_density_simple(patch)
-    return ent, ed
-
-def is_geo_gmaps(img: Image.Image) -> tuple[bool, str]:
-    """
-    GEO/GMAPS dianggap ada jika minimal salah satu terpenuhi:
-    A) Map inset kiri-bawah terlihat "ramai"
-    B) Ada overlay teks putih koordinat/timestamp cukup banyak di bawah-kanan
-    """
-    w, h = img.size
-    if w < 240 or h < 240:
-        return False, "Non-GEO: ukuran terlalu kecil"
-
-    ent, ed = map_inset_score(img)
-    bt = bright_text_score(img)
-
-    # Threshold dibuat lebih "longgar" supaya foto patroli yang valid tidak ke-skip.
-    has_map_inset = (ent >= 3.8 and ed >= 0.045)   # longgar dari sebelumnya
-    has_geo_text  = (bt >= 0.020)                  # 2% piksel terang -> biasanya ada overlay teks
-
-    if has_map_inset and has_geo_text:
-        return True, f"GEO ok (map ent={ent:.2f}, edge={ed:.2f}, text={bt:.3f})"
-    if has_map_inset:
-        return True, f"GEO ok (map ent={ent:.2f}, edge={ed:.2f})"
-    if has_geo_text:
-        return True, f"GEO ok (text={bt:.3f})"
-
-    return False, f"Non-GEO (map ent={ent:.2f}, edge={ed:.2f}, text={bt:.3f})"
-
-def classify_for_audit(img: Image.Image, segment_text: str) -> tuple[bool, str, str]:
-    """
-    RULE FINAL:
-    - Jika GEO/GMAPS terdeteksi -> MASUK AUDIT (logo perusahaan boleh ada).
-    - Jika tidak GEO -> SKIP (Non-Patroli) (termasuk logo-only/template-only).
-    - Keyword segment hanya membantu menjelaskan skip_reason, bukan penentu jika GEO ada.
-    """
-    ok, why = is_geo_gmaps(img)
-    if ok:
-        return True, "", ""
-
-    # Non-GEO -> skip
-    if segment_has_skip_keyword(segment_text):
-        return False, "⏭️ SKIP (Logo/Template)", "SKIP: segment keyword + tidak ada GEO overlay"
-    return False, "⏭️ SKIP (Non-Patroli)", why
-
 
 # =========================
 # DATABASE
@@ -224,6 +108,67 @@ def compute_hashes_from_bytes(img_bytes: bytes):
     ph = str(imagehash.phash(thumb))
     sh = sha256_bytes(img_bytes)
     return sh, ph, thumb, img
+
+# =========================
+# GEO OVERLAY DETECTION (FIX)
+# =========================
+def overlay_geo_score(img: Image.Image) -> tuple[bool, str]:
+    """
+    Deteksi overlay koordinat/timestamp di kanan-bawah:
+    ciri umum: kotak semi-transparan gelap + teks putih.
+    Kita cek patch kanan-bawah:
+      - mean luminance tidak terlalu terang (ada kotak gelap)
+      - ada sebagian piksel sangat terang (teks putih)
+      - ada variasi (std dev) cukup (teks vs background)
+    """
+    w, h = img.size
+    if w < 240 or h < 240:
+        return False, "SKIP: ukuran kecil"
+
+    # patch kanan-bawah (overlay biasanya di sini)
+    x1 = int(w * 0.55)
+    y1 = int(h * 0.65)
+    patch = img.crop((x1, y1, w, h)).convert("L").resize((220, 220))
+
+    px = list(patch.getdata())
+    n = len(px)
+    if n == 0:
+        return False, "SKIP: patch kosong"
+
+    mean = sum(px) / n
+    # std dev
+    var = sum((p - mean) ** 2 for p in px) / n
+    std = math.sqrt(var)
+
+    # proporsi piksel putih (teks putih)
+    white_ratio = sum(1 for p in px if p >= 220) / n
+    # proporsi piksel gelap (kotak overlay)
+    dark_ratio = sum(1 for p in px if p <= 70) / n
+
+    # THRESHOLD disetel agar foto patroli kamu LOLOS
+    # - white_ratio kecil pun oke (teks tipis)
+    # - dark_ratio kecil pun oke (kotak transparan)
+    has_white_text = white_ratio >= 0.006   # 0.6%
+    has_dark_box   = dark_ratio >= 0.010    # 1.0%
+    has_contrast   = std >= 18             # variasi cukup
+
+    # rule: minimal 2 dari 3 -> GEO overlay
+    score = int(has_white_text) + int(has_dark_box) + int(has_contrast)
+    if score >= 2:
+        return True, f"GEO overlay ok (mean={mean:.1f}, std={std:.1f}, white={white_ratio:.3f}, dark={dark_ratio:.3f})"
+
+    return False, f"Non-GEO (mean={mean:.1f}, std={std:.1f}, white={white_ratio:.3f}, dark={dark_ratio:.3f})"
+
+def classify_for_audit(img: Image.Image) -> tuple[bool, str, str]:
+    """
+    FINAL RULE:
+    - Kalau ada GEO overlay -> MASUK AUDIT (logo perusahaan boleh).
+    - Kalau tidak ada GEO overlay -> SKIP (non patroli / logo-only).
+    """
+    ok, why = overlay_geo_score(img)
+    if ok:
+        return True, "", ""
+    return False, "⏭️ SKIP (Non-Patroli)", why
 
 # =========================
 # GOOGLE LINK HANDLING
@@ -326,7 +271,7 @@ def extract_embedded_images(wb, source_file_name: str):
                 if full_img is None:
                     continue
 
-                audit_ok, skip_status, skip_reason = classify_for_audit(full_img, str(segment))
+                audit_ok, skip_status, skip_reason = classify_for_audit(full_img)
                 if not audit_ok:
                     items.append({
                         "source_type": "EmbeddedExcel",
@@ -394,7 +339,7 @@ def extract_link_images(wb, source_file_name: str, max_workers=12):
             if full_img is None:
                 continue
 
-            audit_ok, skip_status, skip_reason = classify_for_audit(full_img, str(segment))
+            audit_ok, skip_status, skip_reason = classify_for_audit(full_img)
             if not audit_ok:
                 out.append({
                     "source_type": "CloudLink",
@@ -456,8 +401,7 @@ def audit_workbook(xlsx_path: str):
 
     if df_audit.empty:
         for col in ["dup_internal_exact","dup_internal_phash","history_status","history_detail","first_seen"]:
-            if col not in df.columns:
-                df[col] = ""
+            df[col] = ""
         return df
 
     df_audit["dup_internal_exact"] = df_audit.duplicated("sha256", keep="first")

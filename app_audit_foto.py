@@ -1,7 +1,7 @@
 import streamlit as st
 import pandas as pd
 from openpyxl import load_workbook
-from PIL import Image, UnidentifiedImageError
+from PIL import Image, UnidentifiedImageError, ImageFilter
 import imagehash
 import io
 import os
@@ -22,17 +22,20 @@ st.title("🕵️ AUDIT FOTO PATROLI")
 st.caption(
     "Audit foto patroli duplicate (Embedded Excel + Google Docs/Drive). "
     "Foto patroli yang punya overlay GEO (timestamp/koordinat + kotak gelap + teks putih) akan DIAUDIT (VALID/GUGUR). "
-    "Logo-only / banner-only akan di-SKIP (tidak masuk VALID/GUGUR)."
+    "Logo-only / banner-only akan di-SKIP (tidak masuk VALID/GUGUR). "
+    "Logo perusahaan di foto GEO itu BOLEH (tetap diaudit)."
 )
 
 # =========================
-# STREAMLIT UI (PINDAH KE ATAS BIAR KELIHATAN)
+# STREAMLIT UI (UPLOADER DI ATAS BIAR NGGAK HILANG)
 # =========================
 uploaded = st.file_uploader("Upload Excel Patroli (.xlsx)", type=["xlsx"])
 
 colA, colB = st.columns([1, 2])
 with colA:
     preview_limit = st.number_input("Maks preview gambar", min_value=0, max_value=500, value=120, step=10)
+with colB:
+    st.info("Reset history ada di sidebar kiri. Logo-only tidak ikut audit, GEO overlay akan diaudit.")
 
 # =========================
 # DATABASE
@@ -112,7 +115,6 @@ def compute_hashes_from_bytes(img_bytes: bytes):
         img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
     except UnidentifiedImageError:
         return None, None, None, None
-
     thumb = img.copy()
     thumb.thumbnail((240, 240))
     ph = str(imagehash.phash(thumb))
@@ -120,7 +122,56 @@ def compute_hashes_from_bytes(img_bytes: bytes):
     return sh, ph, thumb, img
 
 # =========================
-# DETEKSI GEO OVERLAY (LEBIH KUAT)
+# HELPER: METRIK GLOBAL (UNTUK DETEKSI LOGO-ONLY)
+# =========================
+def image_entropy_gray(img: Image.Image) -> float:
+    g = img.convert("L").resize((256, 256))
+    hist = g.histogram()
+    total = sum(hist)
+    if total == 0:
+        return 0.0
+    ent = 0.0
+    for h in hist:
+        if h:
+            p = h / total
+            ent -= p * math.log2(p)
+    return ent
+
+def edge_density(img: Image.Image) -> float:
+    g = img.convert("L").resize((256, 256)).filter(ImageFilter.FIND_EDGES)
+    px = list(g.getdata())
+    mean = sum(px) / (len(px) or 1)
+    return mean / 255.0
+
+def is_logo_only(img: Image.Image) -> tuple[bool, str]:
+    """
+    Deteksi gambar 'logo doang' / banner doang:
+    cirinya: entropi rendah + edge rendah (flat), biasanya background putih/solid.
+    Foto GEO/pemandangan biasanya entropi & edge lebih tinggi, jadi aman.
+    """
+    w, h = img.size
+    if w < 120 or h < 120:
+        return True, "LogoOnly: terlalu kecil"
+
+    ent = image_entropy_gray(img)
+    ed = edge_density(img)
+
+    # Threshold ini sengaja dibuat cukup ketat supaya foto GEO tidak ikut ke-skip.
+    # Logo-only biasanya entropi rendah dan edge rendah.
+    if ent < 3.2 and ed < 0.035:
+        return True, f"LogoOnly: ent={ent:.2f}, edge={ed:.3f}"
+
+    # Extra: kalau sebagian besar gambar putih polos (background), cenderung logo-only
+    g = img.convert("L").resize((256, 256))
+    px = list(g.getdata())
+    bright_ratio = sum(1 for p in px if p >= 240) / (len(px) or 1)
+    if bright_ratio > 0.60 and ed < 0.040:
+        return True, f"LogoOnly: bright={bright_ratio:.2f}, edge={ed:.3f}"
+
+    return False, f"NotLogo: ent={ent:.2f}, edge={ed:.3f}"
+
+# =========================
+# DETEKSI GEO OVERLAY (SCAN BAWAH)
 # =========================
 def _patch_stats(patch_gray: Image.Image):
     px = list(patch_gray.getdata())
@@ -134,21 +185,23 @@ def _patch_stats(patch_gray: Image.Image):
 
 def overlay_geo_best(img: Image.Image) -> tuple[bool, str]:
     """
-    Scan 3 area bawah: kiri-bawah, tengah-bawah, kanan-bawah.
-    Overlay GEO bisa muncul di mana saja di bawah (bukan selalu kanan).
-    Kriteria: 2 dari 3 -> (white_text, dark_box, contrast).
+    Scan 3 area bawah: kiri, tengah, kanan (karena overlay bisa pindah posisi).
+    Rule: minimal 2 dari 3 indikator:
+      - white text ratio
+      - dark box ratio
+      - contrast (std)
     """
     w, h = img.size
     if w < 240 or h < 240:
-        return False, "SKIP: ukuran kecil"
+        return False, "NonGEO: ukuran kecil"
 
     rois = [
-        ("LB", (0.00, 0.65, 0.45, 1.00)),   # left-bottom
-        ("MB", (0.25, 0.65, 0.75, 1.00)),   # mid-bottom
-        ("RB", (0.55, 0.65, 1.00, 1.00)),   # right-bottom
+        ("LB", (0.00, 0.65, 0.45, 1.00)),
+        ("MB", (0.25, 0.65, 0.75, 1.00)),
+        ("RB", (0.55, 0.65, 1.00, 1.00)),
     ]
 
-    best = None
+    best_score = -1
     best_dbg = ""
 
     for name, (x0, y0, x1, y1) in rois:
@@ -158,32 +211,37 @@ def overlay_geo_best(img: Image.Image) -> tuple[bool, str]:
         patch = img.crop((X0, Y0, X1, Y1)).convert("L").resize((240, 240))
         mean, std, white_ratio, dark_ratio = _patch_stats(patch)
 
-        has_white_text = white_ratio >= 0.004   # 0.4%
-        has_dark_box   = dark_ratio  >= 0.008   # 0.8%
+        has_white_text = white_ratio >= 0.004
+        has_dark_box   = dark_ratio  >= 0.008
         has_contrast   = std >= 16
 
         score = int(has_white_text) + int(has_dark_box) + int(has_contrast)
         dbg = f"{name}: mean={mean:.1f}, std={std:.1f}, white={white_ratio:.3f}, dark={dark_ratio:.3f}, score={score}"
 
-        if best is None or score > best:
-            best = score
+        if score > best_score:
+            best_score = score
             best_dbg = dbg
 
-    if best is not None and best >= 2:
-        return True, f"GEO overlay terdeteksi ✅ ({best_dbg})"
-
-    return False, f"Non-GEO ({best_dbg})"
+    if best_score >= 2:
+        return True, f"GEO✅ ({best_dbg})"
+    return False, f"NonGEO ({best_dbg})"
 
 def classify_for_audit(img: Image.Image) -> tuple[bool, str, str]:
     """
-    RULE FINAL:
-    - Ada GEO overlay -> MASUK AUDIT (logo perusahaan boleh ada)
-    - Tidak ada GEO overlay -> SKIP (logo-only / banner-only / non patroli)
+    RULE FINAL (sesuai komplain kamu):
+    1) Kalau LOGO-ONLY -> SKIP (tidak audit, tidak valid/gugur)
+    2) Kalau bukan logo-only:
+       - Ada GEO overlay -> AUDIT (valid/gugur) walau ada logo perusahaan
+       - Tidak ada GEO -> SKIP
     """
-    ok, why = overlay_geo_best(img)
+    logo, logo_dbg = is_logo_only(img)
+    if logo:
+        return False, "⏭️ SKIP (Logo-Only)", logo_dbg
+
+    ok, geo_dbg = overlay_geo_best(img)
     if ok:
         return True, "", ""
-    return False, "⏭️ SKIP (Non-Patroli)", why
+    return False, "⏭️ SKIP (Non-Patroli)", geo_dbg
 
 # =========================
 # GOOGLE LINK HANDLING
@@ -283,7 +341,7 @@ def extract_embedded_images(wb, source_file_name: str):
 
                 raw = img_obj._data()
                 sh, ph, thumb, full_img = compute_hashes_from_bytes(raw)
-                if full_img is None or not sh:
+                if full_img is None:
                     continue
 
                 audit_ok, skip_status, skip_reason = classify_for_audit(full_img)
@@ -304,6 +362,7 @@ def extract_embedded_images(wb, source_file_name: str):
                     })
                     continue
 
+                # masuk audit
                 items.append({
                     "source_type": "EmbeddedExcel",
                     "source_file": source_file_name,
@@ -351,7 +410,7 @@ def extract_link_images(wb, source_file_name: str, max_workers=12):
             if not b:
                 continue
             sh, ph, thumb, full_img = compute_hashes_from_bytes(b)
-            if full_img is None or not sh:
+            if full_img is None:
                 continue
 
             audit_ok, skip_status, skip_reason = classify_for_audit(full_img)
@@ -409,6 +468,7 @@ def audit_workbook(xlsx_path: str):
     if df.empty:
         return df
 
+    # yang benar-benar masuk audit: status_akhir kosong + sha256 ada
     audited_mask = (df["status_akhir"].astype(str).str.strip() == "") & (df["sha256"].astype(str).str.strip() != "")
     df_audit = df[audited_mask].copy()
     df_skip = df[~audited_mask].copy()
@@ -418,6 +478,7 @@ def audit_workbook(xlsx_path: str):
             df[col] = ""
         return df
 
+    # duplikat internal
     df_audit["dup_internal_exact"] = df_audit.duplicated("sha256", keep="first")
     df_audit["dup_internal_phash"] = df_audit.duplicated("phash", keep="first")
 
@@ -425,6 +486,7 @@ def audit_workbook(xlsx_path: str):
     today = datetime.now().strftime("%Y-%m-%d")
     df_audit["first_seen"] = today
 
+    # history check
     hist_status, hist_detail = [], []
     for _, row in df_audit.iterrows():
         exact, ph = db_lookup(conn, row["sha256"], row["phash"])
@@ -453,6 +515,7 @@ def audit_workbook(xlsx_path: str):
 
     df_audit["status_akhir"] = df_audit.apply(decide, axis=1)
 
+    # simpan hanya VALID ke history
     for _, r in df_audit[df_audit["status_akhir"] == "✅ VALID"].iterrows():
         db_insert(conn, {
             "sha256": r["sha256"],
@@ -469,6 +532,7 @@ def audit_workbook(xlsx_path: str):
     conn.commit()
     conn.close()
 
+    # rapihin kolom skip
     for col in ["dup_internal_exact","dup_internal_phash","history_status","history_detail","first_seen"]:
         if col not in df_skip.columns:
             df_skip[col] = ""
@@ -493,16 +557,18 @@ if uploaded:
             else:
                 status.update(label="Audit selesai.", state="complete")
 
-                audited_only = df[~df["status_akhir"].astype(str).str.startswith("⏭️ SKIP")]
+                audited_only = df[(df["status_akhir"].astype(str).str.startswith("✅")) |
+                                  (df["status_akhir"].astype(str).str.contains("GUGUR")) |
+                                  (df["status_akhir"].astype(str).str.contains("CEK MANUAL"))]
 
-                st.subheader("Ringkasan")
+                st.subheader("Ringkasan (HANYA yang diaudit)")
                 c1, c2, c3, c4 = st.columns(4)
-                c1.metric("Total Foto (Diaudit)", len(audited_only))
+                c1.metric("Total Diaudit", len(audited_only))
                 c2.metric("VALID", int((audited_only["status_akhir"] == "✅ VALID").sum()))
                 c3.metric("GUGUR", int(audited_only["status_akhir"].astype(str).str.contains("GUGUR").sum()))
                 c4.metric("CEK MANUAL", int(audited_only["status_akhir"].astype(str).str.contains("CEK MANUAL").sum()))
 
-                st.subheader("Laporan")
+                st.subheader("Laporan (Termasuk SKIP)")
                 report = df.drop(columns=["thumb"], errors="ignore")
                 st.dataframe(report, use_container_width=True)
 
@@ -524,9 +590,11 @@ if uploaded:
                     s = str(s)
                     if "GUGUR" in s or "CEK MANUAL" in s:
                         return 0
-                    if s.startswith("⏭️ SKIP"):
+                    if s.startswith("✅"):
                         return 1
-                    return 2
+                    if s.startswith("⏭️ SKIP"):
+                        return 2
+                    return 3
 
                 df_view = df.copy()
                 df_view["_p"] = df_view["status_akhir"].map(prio)

@@ -4,4 +4,4 @@ openpyxl
 Pillow
 ImageHash
 requests
-python-dateutil
+numpy

@@ -20,10 +20,7 @@ import math
 st.set_page_config(page_title="Audit Foto Patroli", layout="wide")
 st.title("🕵️ AUDIT FOTO PATROLI")
 st.caption(
-    "Audit foto patroli duplicate (Embedded Excel + Google Docs/Drive). "
-    "Foto patroli yang punya overlay GEO (timestamp/koordinat + kotak gelap + teks putih) akan DIAUDIT (VALID/GUGUR). "
-    "Logo-only / banner-only akan di-SKIP (tidak masuk VALID/GUGUR). "
-    "Logo perusahaan di foto GEO itu BOLEH (tetap diaudit)."
+    "Audit foto patroli yang ter-duplicate (Embedded Excel + Google Docs/Drive). Set maks. preview gambar 500."
 )
 
 # =========================
